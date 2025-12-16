@@ -20,11 +20,15 @@ namespace fancy
     }
     inline std::ostream &mainTag(std::ostream &os = std::cout)
     {
-        return os << bold << red << "[MAIN]: " << reset;
+        return os << bold << red << "[Main]: " << reset;
     }
     inline std::ostream &VTIWriterTag(std::ostream &os = std::cout)
     {
         return os << bold << green << "[VTIWRITER]: " << reset;
+    }
+    inline std::ostream &timerTag(std::ostream &os = std::cout)
+    {
+        return os << bold << blue << "[Timer]: " << reset;
     }
 
     // ON / OFF toggle (bool)
