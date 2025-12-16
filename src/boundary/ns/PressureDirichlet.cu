@@ -134,7 +134,7 @@ void PressureDirichlet<D3Q19>::apply(Lattice<D3Q19>& lat, BoundaryPhase phase, i
 
     // apply outlet rho BC
     k_pressure_dirichlet_outlet_d3q19<<<grid, block>>>(
-        lat.d_f_ptr(),
+        lat.d_f_new_ptr(),
         mask_d,
         p.Nx, p.Ny, p.Nz,
         rho_out

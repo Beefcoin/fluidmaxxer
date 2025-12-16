@@ -5,9 +5,11 @@
 // Collision Operators
 #include "collision/BGKCollision.hpp"
 #include "collision/ADBGKCollision.hpp"
+#include "collision/PorousBGKCollision.hpp"
 
 // NS Boundary Conditions
 #include "boundary/ns/VelocityDirichlet.hpp"
+#include "boundary/ns/VelocityDirichletNEQ.hpp"
 #include "boundary/ns/PressureDirichlet.hpp"
 #include "boundary/ns/BounceBack.hpp"
 
@@ -36,6 +38,66 @@
 // Helpers
 #include "core/helpers/helpers.hpp"
 
+/* this calculates the equivalent particle diffusivity based on the particle porosity
+it is based on the Mackie-Meares correlation (Mackie and Meares, 1955) */
+DATA_TYPE computeEffectiveDiffusivity(DATA_TYPE Dm, DATA_TYPE epsParticle)
+{
+    DATA_TYPE numerator = epsParticle;
+    DATA_TYPE denominator = std::pow(2.0 - epsParticle, 2.0);
+    return (numerator / denominator) * Dm;
+}
+
+DATA_TYPE calculateInletVelocityFromPeclet(
+    DATA_TYPE peclet,           // target Pe (dimensionless)
+    DATA_TYPE diffusivity,      // D [m^2/s]
+    DATA_TYPE particleDiameter, // particle diameter in meters
+    DATA_TYPE porosity          // eps in (0,1]
+)
+{
+    static_assert(std::is_floating_point<DATA_TYPE>::value, "T must be floating point");
+    if (peclet <= DATA_TYPE(0) || diffusivity <= DATA_TYPE(0) || particleDiameter <= DATA_TYPE(0))
+        throw std::invalid_argument("Pe, D, and Lc must be positive.");
+    if (porosity <= DATA_TYPE(0) || porosity > DATA_TYPE(1))
+        throw std::invalid_argument("Porosity eps must be in (0,1].");
+
+    return (peclet * diffusivity / particleDiameter) * porosity; // u_s [m/s]
+}
+
+DATA_TYPE calculateInterstitialVelocity(
+    DATA_TYPE superficialVelocity, // u_s [m/s]
+    DATA_TYPE porosity             // eps in (0,1]
+)
+{
+    static_assert(std::is_floating_point<DATA_TYPE>::value, "T must be floating point");
+    if (superficialVelocity < DATA_TYPE(0))
+        throw std::invalid_argument("Superficial velocity must be non-negative.");
+    if (porosity <= DATA_TYPE(0) || porosity > DATA_TYPE(1))
+        throw std::invalid_argument("Porosity eps must be in (0,1].");
+
+    return superficialVelocity / porosity;
+}
+
+DATA_TYPE calculatekFilm(DATA_TYPE Re, DATA_TYPE kinematicViscosity, DATA_TYPE soluteDiffusivity, DATA_TYPE particlePorosity, DATA_TYPE particleDiameter)
+{
+    // calculate Schmidt Number
+    fancy::kFilmTag() << std::setprecision(2) << "Re = " << Re << std::endl;
+    DATA_TYPE Sc = kinematicViscosity / soluteDiffusivity;
+    fancy::kFilmTag() << "Sc = " << Sc << std::endl;
+    DATA_TYPE Sh = 1.09 * particlePorosity * pow(particlePorosity * Re, 0.33) * pow(Sc, 0.33);
+    fancy::kFilmTag() << "Sh = " << Sh << std::endl;
+    DATA_TYPE k_film = Sh * soluteDiffusivity / particleDiameter;
+    return k_film;
+}
+
+DATA_TYPE calculatekLDF(DATA_TYPE geometryPorosity, DATA_TYPE particleDiameter, DATA_TYPE k_film, DATA_TYPE timestep)
+{
+    DATA_TYPE a_s = 3 * (1 - geometryPorosity) / (particleDiameter / 2);
+    DATA_TYPE k_ldf = a_s * k_film;
+    DATA_TYPE k_ldf_LU = k_ldf * timestep;
+    fancy::configTag() << "Calculated k_ldf = " << k_ldf << " -> " << k_ldf_LU << " [1/timestep]" << std::endl;
+    return k_ldf_LU;
+}
+
 int main(int argc, char **argv)
 {
     // Definitions for Descriptors and Unit Converters
@@ -47,12 +109,18 @@ int main(int argc, char **argv)
     const bool enableCoupling = hasFlag(argc, argv, "--coupling");
     const bool enablePulse = hasFlag(argc, argv, "--pulse");
     const bool enableAdsorb = hasFlag(argc, argv, "--adsorb");
+    const bool writeVTI = hasFlag(argc, argv, "--vti");
+    // const bool useZouHe = hasFlag(argc, argv, "--zouhe");
 
     fancy::mainTag() << "Starting Coupled LBM Simulation\n";
     fancy::mainTag() << "Coupling: ";
     fancy::onOff(std::cout, enableCoupling);
     std::cout << " | Inlet pulse: ";
     fancy::onOff(std::cout, enablePulse);
+    std::cout << " | Adsorption: ";
+    fancy::onOff(std::cout, enableAdsorb);
+    std::cout << " | writeVTI: ";
+    fancy::onOff(std::cout, writeVTI);
     std::cout << "\n";
 
     // Upload Descriptor Constants to GPU Device
@@ -77,36 +145,52 @@ int main(int argc, char **argv)
     p.periodicZ = true;
 
     // Simulation Params
-    const bool writeVTI = false;
+    const DATA_TYPE resolution = DATA_TYPE(15);
+    const DATA_TYPE particleDiameter = DATA_TYPE(0.0002); // this is the charPhysLength
+    const DATA_TYPE Peclet = DATA_TYPE(40);               // This is the Peclet used for calculating inlet velocity
 
-    const DATA_TYPE maxPhysT = DATA_TYPE(80);
-    const DATA_TYPE injectionTimePhys = DATA_TYPE(0.5);
-
-    const DATA_TYPE Lx_phys = DATA_TYPE(0.0002);
-    const DATA_TYPE U_phys = DATA_TYPE(0.000104);
+    // NS-Settings
     const DATA_TYPE nu_phys = DATA_TYPE(1.0e-6);
     const DATA_TYPE rho_phys = DATA_TYPE(1000.0);
 
+    // Time Params
+    const DATA_TYPE maxPhysT = DATA_TYPE(80);
+    const DATA_TYPE injectionTimePhys = DATA_TYPE(0.5);
+
+    // Porosity Params
+    const DATA_TYPE geometryPorosity = 0.26;
+    const DATA_TYPE particlePorosity = 0.67;
+
     // Diffusion
     const DATA_TYPE D_fluid = DATA_TYPE(2e-09);
-    const DATA_TYPE D_solid = DATA_TYPE(7.57533e-10);
+    const DATA_TYPE D_solid = computeEffectiveDiffusivity(D_fluid, particlePorosity);
+    fancy::configTag() << "Calculated Deff = " << D_solid << " for ε = " << particlePorosity << std::endl;
 
+    // calculate velocities
+    const DATA_TYPE inletVelocity = calculateInletVelocityFromPeclet(Peclet, D_fluid, particleDiameter, geometryPorosity);
+    const DATA_TYPE charPhysVelocity = calculateInterstitialVelocity(inletVelocity, geometryPorosity);
+    fancy::configTag() << "Using Peclet number to calculate Inlet velocity. Inlet Velocity = " << inletVelocity << " for Pe = " << Peclet << " and particle diameter D = " << particleDiameter << std::endl;
+    fancy::configTag() << "Calculated intersitial velocity from geometry porosity ε(geom) = " << geometryPorosity << " to vi = " << charPhysVelocity << std::endl;
+
+    // Create UnitConverter and Debug
+    UnitConverter uc(particleDiameter, charPhysVelocity, nu_phys, rho_phys, resolution, Nx, Ny, Nz, 0.75);
+    uc.printInfo();
+    const DATA_TYPE domainSize = Nx * uc.dx_phys;
+    fancy::configTag() << std::fixed << std::setprecision(9) << "DomainSize = " << domainSize << std::endl;
     // Adsorption
     const DATA_TYPE qMax = DATA_TYPE(1.0);
     const DATA_TYPE KHenry = DATA_TYPE(2);
-    const DATA_TYPE kA = DATA_TYPE(7.10943e-06);
+    const DATA_TYPE kA = calculatekFilm(uc.reynolds(), nu_phys, D_fluid, particlePorosity, particleDiameter);
+    fancy::configTag() << std::setprecision(9) << "Calulcated Particle Mass Transfer Rate to k_film = " << kA << std::endl;
+
+    // Calculate linear driving force rate in lattice units
+    const DATA_TYPE k_ldf_LU = calculatekLDF(geometryPorosity, particleDiameter, kA, uc.dt_phys);
 
     // adsorption params (linear Isotherm)
     p.enableAdsorption = enableAdsorb;
     p.qMax = qMax;
-    p.bLangmuir = KHenry;
-    p.kLDF = kA;
     p.KHenry = KHenry;
-    p.kA = kA;
-
-    // Create UnitConverter and Debug
-    UnitConverter uc(Lx_phys, U_phys, nu_phys, rho_phys, Nx, Ny, Nz, 0.75);
-    uc.printInfo();
+    p.kA = k_ldf_LU;
 
     // set derived values from uc
     p.rho0 = static_cast<DATA_TYPE>(uc.rho_lbm);
@@ -117,7 +201,8 @@ int main(int argc, char **argv)
     ADLattice<Descriptor_AD> Lattice_AD(p);
 
     // set Collision Operators
-    auto Collision_NS = std::make_shared<BGKCollision<Descriptor_NS>>(p);
+    // auto Collision_NS = std::make_shared<BGKCollision<Descriptor_NS>>(p);
+    auto Collision_NS = std::make_shared<PorousBGKCollision<Descriptor_NS>>(p);
     Lattice_NS.setCollisionOperator(Collision_NS);
 
     auto Collision_AD = std::make_shared<ADBGKCollision<Descriptor_AD>>(p);
@@ -130,14 +215,29 @@ int main(int argc, char **argv)
 
     // set NS-Lattice Obstacle Mask for BounceBack BC
     Lattice_NS.setObstacleMask(geom.mask);
+    Lattice_NS.setPorosityFromMask(geom.mask, particlePorosity, DATA_TYPE(1.0));
+
+    std::vector<DATA_TYPE> phiHost(p.Nx * p.Ny * p.Nz);
+    cudaMemcpyDtoH(phiHost.data(), Lattice_NS.d_porosity_ptr(),
+                   phiHost.size() * sizeof(DATA_TYPE));
+    DATA_TYPE mn = phiHost[0], mx = phiHost[0];
+    for (auto v : phiHost)
+    {
+        mn = std::min(mn, v);
+        mx = std::max(mx, v);
+    }
+    fancy::debugTag() << "Porosity min=" << mn << " max=" << mx << "\n";
 
     // set boundary conditions for NS-Lattice
-    const DATA_TYPE u_in = static_cast<DATA_TYPE>(uc.velocityPhysToLattice(static_cast<double>(U_phys)));
+    const DATA_TYPE u_in = static_cast<DATA_TYPE>(uc.velocityPhysToLattice(static_cast<double>(inletVelocity)));
     const DATA_TYPE rho_out = p.rho0;
 
-    Lattice_NS.addBoundary<VelocityDirichletEq<Descriptor_NS>>(p, inletMask, u_in, DATA_TYPE(0), DATA_TYPE(0));
+    // Lattice_NS.addBoundary<VelocityDirichletEq<Descriptor_NS>>(p, inletMask, u_in, DATA_TYPE(0), DATA_TYPE(0));
+    Lattice_NS.addBoundary<VelocityDirichletNEQ<Descriptor_NS>>(p, inletMask, u_in, DATA_TYPE(0), DATA_TYPE(0));
+
     Lattice_NS.addBoundary<PressureDirichlet<Descriptor_NS>>(p, outletMask, rho_out);
-    Lattice_NS.addBoundary<BounceBack<Descriptor_NS>>(p, geom.mask);
+
+    // Lattice_NS.addBoundary<BounceBack<Descriptor_NS>>(p, geom.mask);
 
     // --- Diffusion & Adsorption Init ---
     // create AD-Unit Converter
@@ -149,7 +249,6 @@ int main(int argc, char **argv)
     // Create Adsorption fields
     AdsorbedField qField(p);
     LinearLDF<Descriptor_AD> LinearIsothermAdsorption(p);
-    // LangmuirLDF<Descriptor_AD> LangmuirLDF(p);
 
     // set inlet/outlet conditions for AD-Lattice
     if (enablePulse)

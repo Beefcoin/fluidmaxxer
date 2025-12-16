@@ -51,7 +51,40 @@ __global__ void k_velocity_dirichlet_eq_post_d3q19(
     }
 }
 
-template<>
+__global__ void k_velocity_dirichlet_eq_pre_d3q19(
+    DATA_TYPE* __restrict__ f,
+    const std::uint8_t* __restrict__ mask,
+    int nCells,
+    DATA_TYPE rho0,
+    DATA_TYPE ux, DATA_TYPE uy, DATA_TYPE uz
+){
+    int cell = blockIdx.x * blockDim.x + threadIdx.x;
+    if (cell >= nCells) return;
+    if (!mask[cell]) return;
+
+    int base = cell * 19;
+    DATA_TYPE u2 = ux*ux + uy*uy + uz*uz;
+
+    #pragma unroll
+    for (int q = 0; q < 19; ++q) {
+        DATA_TYPE eu =
+            DATA_TYPE(c19_cx[q]) * ux +
+            DATA_TYPE(c19_cy[q]) * uy +
+            DATA_TYPE(c19_cz[q]) * uz;
+
+        DATA_TYPE cu  = DATA_TYPE(3) * eu;
+        DATA_TYPE feq = c19_w[q] * rho0 *
+                        (DATA_TYPE(1)
+                         + cu
+                         + DATA_TYPE(0.5) * cu * cu
+                         - DATA_TYPE(1.5) * u2);
+
+        f[base + q] = feq;
+    }
+}
+
+
+/* template<>
 void VelocityDirichletEq<D3Q19>::apply(Lattice<D3Q19>& lat, BoundaryPhase phase, int)
 {
     // only after streaming
@@ -73,6 +106,28 @@ void VelocityDirichletEq<D3Q19>::apply(Lattice<D3Q19>& lat, BoundaryPhase phase,
 
     // check kernel launch
     cudaCheckThrow("k_velocity_dirichlet_eq_post_d3q19");
+} */
+
+template<>
+void VelocityDirichletEq<D3Q19>::apply(Lattice<D3Q19>& lat, BoundaryPhase phase, int)
+{
+    // only before collision (important for pull streaming)
+    if (phase != BoundaryPhase::PreCollision) return;
+
+    int n = lat.Size();
+    int block = 256;
+    int grid  = (n + block - 1) / block;
+
+    k_velocity_dirichlet_eq_pre_d3q19<<<grid, block>>>(
+        lat.d_f_ptr(),   // <-- IMPORTANT: write to f, not f_new
+        d_mask,
+        n,
+        params.rho0,
+        u0x, u0y, u0z
+    );
+
+    cudaCheckThrow("k_velocity_dirichlet_eq_pre_d3q19");
 }
+
 
 template class VelocityDirichletEq<D3Q19>;

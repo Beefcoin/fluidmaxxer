@@ -35,6 +35,14 @@ public:
         d_obstacle = static_cast<std::uint8_t *>(cudaMallocBytes(bytesMask));
         cudaMemsetBytes(d_obstacle, 0, bytesMask);
 
+        // porosity mask
+        d_porosity = static_cast<DATA_TYPE *>(cudaMallocBytes(std::size_t(nCells) * sizeof(DATA_TYPE)));
+        cudaMemsetBytes(d_porosity, 0, std::size_t(nCells) * sizeof(DATA_TYPE));
+
+        // not used for now
+        d_us = static_cast<DATA_TYPE *>(cudaMallocBytes(std::size_t(3) * std::size_t(nCells) * sizeof(DATA_TYPE)));
+        cudaMemsetBytes(d_us, 0, std::size_t(3) * std::size_t(nCells) * sizeof(DATA_TYPE));
+
         // host side output buffers
         h_rho.assign(nCells, static_cast<DATA_TYPE>(params.rho0));
         h_ux.assign(nCells, DATA_TYPE(0));
@@ -61,6 +69,11 @@ public:
         d_f = d_f_new = nullptr;
         d_obstacle = nullptr;
         d_rho = d_ux = d_uy = d_uz = nullptr;
+
+        cudaFreeBytes(d_porosity);
+        cudaFreeBytes(d_us);
+        d_porosity = nullptr;
+        d_us = nullptr;
     }
 
     Lattice(const Lattice &) = delete;
@@ -70,6 +83,34 @@ public:
     inline int cellIndex(int x, int y, int z) const
     {
         return x + params.Nx * (y + params.Ny * z);
+    }
+
+    void setPorosityFromMask(const std::vector<std::uint8_t> &mask,
+                             DATA_TYPE phiMasked,
+                             DATA_TYPE phiElse)
+    {
+        const int n = this->Size();
+        if (static_cast<int>(mask.size()) != n)
+        {
+            throw std::runtime_error("setPorosityFromMask: mask size != lattice size");
+        }
+
+        std::vector<DATA_TYPE> h_phi(n, phiElse);
+        for (int i = 0; i < n; ++i)
+        {
+            if (mask[i])
+                h_phi[i] = phiMasked;
+        }
+
+        // allocate device porosity if not already allocated
+        if (!d_porosity)
+        {
+            d_porosity = static_cast<DATA_TYPE *>(cudaMallocBytes(std::size_t(n) * sizeof(DATA_TYPE)));
+        }
+
+        // upload to device
+        cudaMemcpyHtoD(d_porosity, h_phi.data(), std::size_t(n) * sizeof(DATA_TYPE));
+        cudaCheckThrow("setPorosityFromMask");
     }
 
     // Parameter getters
@@ -98,6 +139,13 @@ public:
 
     DATA_TYPE *d_uz_ptr() { return d_uz; }
     const DATA_TYPE *d_uz_ptr() const { return d_uz; }
+
+    // porosity pointer
+    DATA_TYPE *d_porosity_ptr() { return d_porosity; }
+    const DATA_TYPE *d_porosity_ptr() const { return d_porosity; }
+
+    DATA_TYPE *d_us_ptr() { return d_us; }
+    const DATA_TYPE *d_us_ptr() const { return d_us; }
 
     // set obstacle mask, might be used for BounceBack BC or Collision (kernel BOunceback or porosity)
     void setObstacleMask(const std::vector<std::uint8_t> &mask)
@@ -195,6 +243,10 @@ private:
     DATA_TYPE *d_ux = nullptr;
     DATA_TYPE *d_uy = nullptr;
     DATA_TYPE *d_uz = nullptr;
+
+    // porosity
+    DATA_TYPE *d_porosity = nullptr; // size = nCells
+    DATA_TYPE *d_us = nullptr;       // size = 3*nCells (optional)
 
     // host buffers for output
     std::vector<DATA_TYPE> h_rho, h_ux, h_uy, h_uz;
