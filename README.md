@@ -20,7 +20,7 @@ and additional simulation options.
 
 ## Build and Run
 
-Currently, the only example is a coupled NS–AD simulation with adsorption,
+Currently, the only example is a coupled NS-AD simulation with adsorption,
 implemented in `main.cpp`.
 
 Build instructions:
