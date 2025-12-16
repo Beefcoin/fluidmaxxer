@@ -77,6 +77,11 @@ int main(int argc, char **argv)
     p.periodicZ = true;
 
     // Simulation Params
+    const bool writeVTI = false;
+
+    const DATA_TYPE maxPhysT = DATA_TYPE(80);
+    const DATA_TYPE injectionTimePhys = DATA_TYPE(0.5);
+
     const DATA_TYPE Lx_phys = DATA_TYPE(0.0002);
     const DATA_TYPE U_phys = DATA_TYPE(0.000104);
     const DATA_TYPE nu_phys = DATA_TYPE(1.0e-6);
@@ -134,23 +139,6 @@ int main(int argc, char **argv)
     Lattice_NS.addBoundary<PressureDirichlet<Descriptor_NS>>(p, outletMask, rho_out);
     Lattice_NS.addBoundary<BounceBack<Descriptor_NS>>(p, geom.mask);
 
-    // set boundary conditions for AD-Lattice
-    if (enablePulse)
-    {
-        const DATA_TYPE phi_base = DATA_TYPE(0.0);
-        const DATA_TYPE phi_amp = DATA_TYPE(1.0);
-        const int t_on = 0;
-        const int t_off = 20000;
-        const DATA_TYPE k_steps = DATA_TYPE(50.0);
-
-        Lattice_AD.addBoundary<ADDirichletTanhPulse<Descriptor_AD>>(p, inletMask, phi_base, phi_amp, t_on, t_off, k_steps);
-    }
-    else
-    {
-        Lattice_AD.addBoundary<ADDirichlet<Descriptor_AD>>(p, inletMask, DATA_TYPE(1.0));
-    }
-    Lattice_AD.addBoundary<ADNeumannOutlet<Descriptor_AD>>(p, outletMask);
-
     // --- Diffusion & Adsorption Init ---
     // create AD-Unit Converter
     ADUC UnitConverter_AD(Nx, Ny, Nz, uc.dx_phys, uc.dt_phys);
@@ -160,8 +148,36 @@ int main(int argc, char **argv)
 
     // Create Adsorption fields
     AdsorbedField qField(p);
-    //LinearLDF<Descriptor_AD> LinearIsothermAdsorption(p);
-    LangmuirLDF<Descriptor_AD> LangmuirLDF(p);
+    LinearLDF<Descriptor_AD> LinearIsothermAdsorption(p);
+    // LangmuirLDF<Descriptor_AD> LangmuirLDF(p);
+
+    // set inlet/outlet conditions for AD-Lattice
+    if (enablePulse)
+    {
+        const int iTmax = static_cast<int>(uc.timePhysToLattice(injectionTimePhys));
+
+        const DATA_TYPE phi_base = DATA_TYPE(0.0);
+        const DATA_TYPE phi_amp = DATA_TYPE(1.0);
+
+        const int t_on = static_cast<int>(DATA_TYPE(0.10) * iTmax);
+        const int t_off = static_cast<int>(DATA_TYPE(0.90) * iTmax);
+
+        const DATA_TYPE k_steps = DATA_TYPE(0.05) * DATA_TYPE(iTmax);
+
+        fancy::mainTag() << std::fixed << std::setprecision(0)
+                         << "Pulse enabled, iTmax=" << iTmax
+                         << " t_on=" << t_on << " t_off=" << t_off
+                         << " k=" << k_steps << "\n";
+
+        Lattice_AD.addBoundary<ADDirichletTanhPulse<Descriptor_AD>>(
+            p, inletMask, phi_base, phi_amp, t_on, t_off, k_steps);
+    }
+
+    else
+    {
+        Lattice_AD.addBoundary<ADDirichlet<Descriptor_AD>>(p, inletMask, DATA_TYPE(1.0));
+    }
+    Lattice_AD.addBoundary<ADNeumannOutlet<Descriptor_AD>>(p, outletMask);
 
     // --- Lattice Initialization ---
     Lattice_NS.initEquilibrium();
@@ -188,12 +204,16 @@ int main(int argc, char **argv)
         Lattice_AD);
 
     // --- Step definitions ---
-    const int steps = 20000000;
+    const int steps = uc.timePhysToLattice(maxPhysT);
     const int outputEvery = 10000;
     const int csvEvery = 10000;
+    fancy::mainTag() << "Time Settings: maxPhysT = " << std::fixed << std::setprecision(2) << maxPhysT << " steps = " << steps << " outputEvery = " << outputEvery << "\n";
 
     // write first step
-    w.writeStep(Lattice_NS, uc.timeLatticeToPhys(0), 0);
+    if (writeVTI)
+    {
+        w.writeStep(Lattice_NS, uc.timeLatticeToPhys(0), 0);
+    }
     outletCsv.log(0);
 
     // --- Main Simulation Loop ---
@@ -211,8 +231,8 @@ int main(int argc, char **argv)
             // reset source
             Lattice_AD.zeroSource();
             // compute source
-            //LinearIsothermAdsorption.computeSource(Lattice_AD, qField, Lattice_NS.d_obstacle_ptr());
-            LangmuirLDF.computeSource(Lattice_AD, qField, Lattice_NS.d_obstacle_ptr());
+            LinearIsothermAdsorption.computeSource(Lattice_AD, qField, Lattice_NS.d_obstacle_ptr());
+            // LangmuirLDF.computeSource(Lattice_AD, qField, Lattice_NS.d_obstacle_ptr());
         }
         Lattice_AD.step(s);
 
@@ -221,10 +241,18 @@ int main(int argc, char **argv)
 
         if (s % outputEvery == 0)
         {
+            const double pct = 100.0 * double(s) / double(steps);
             if (enableAdsorb)
+            {
                 qField.download();
-            std::cout << "step " << s << "/" << steps << "\n";
-            w.writeStep(Lattice_NS, uc.timeLatticeToPhys(s), s);
+            }
+            fancy::timerTag()
+                << "Step " << s << "/" << steps << " | physT = " << uc.timeLatticeToPhys(s) << " (" << fancy::yellow << fancy::bold << std::fixed << std::setprecision(2) << pct << "%" << fancy::reset << ")" << "\n";
+
+            if (writeVTI)
+            {
+                w.writeStep(Lattice_NS, uc.timeLatticeToPhys(s), s);
+            }
             outletCsv.flush();
         }
     }
